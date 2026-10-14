@@ -3,7 +3,10 @@ pH Strip Reader API  (v2 - for the DFU pH mat workflow)
 -------------------------------------------------------
 POST /analyze  (multipart form)
   file       : the mat photo (required)
-  boxes      : optional JSON. Pad locations, normalized 0-1, [left, top, right, bottom].
+  (default)  : no boxes needed. The mat detector finds the pads by color, ignores tape/lines,
+               excludes the reference card, and uses the card (bottom-right corner) to name
+               each pad by location no matter how the phone was rotated.
+  boxes      : optional JSON (only if you want to supply your own pad boxes). Pad locations, normalized 0-1, [left, top, right, bottom].
                Accepts either [[l,t,r,b], ...] or {"zones":[{"zone_id":..,"bbox":[..]}], "white_box":[..]}
                (this is exactly what the n8n "locate pH strips" node returns)
   white_box  : optional JSON [l,t,r,b] of a plain white area (mat background / white card)
@@ -104,10 +107,104 @@ def detect_opencv(img):
     return out
 
 
-def white_balance(img, white_px_box=None):
-    """Scale channels so a known-white area becomes neutral. Falls back to gray-world."""
+def detect_mat(img):
+    """Deterministic pad finder for the DFU mat (no AI).
+    1. Estimate the white paper color.
+    2. Find compact blobs that differ strongly from paper (pads + reference card swatches).
+       Pale tape, pencil lines, gray border and shadows are rejected by color/size/shape.
+    3. Reference card = tight cluster of many swatches -> excluded from pads.
+    4. Orientation: the card marks the bottom-right corner, so pads are named the same way
+       no matter how the phone was rotated."""
+    H, W = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(float)
+    L = lab[..., 0] * 100 / 255; a = lab[..., 1] - 128; b = lab[..., 2] - 128
+    C = np.hypot(a, b)
+    paper = (C < 10) & (L > np.percentile(L, 40))
+    if paper.sum() < 100:
+        paper = L > np.percentile(L, 70)
+    Lp, ap, bp = np.median(L[paper]), np.median(a[paper]), np.median(b[paper])
+    paper_bgr = np.median(img[paper].reshape(-1, 3), axis=0)
+    dE = np.sqrt((L - Lp) ** 2 + (a - ap) ** 2 + (b - bp) ** 2)
+    mask = ((dE > 35) & ((C > 15) | (L < Lp - 35))).astype(np.uint8) * 255
+    k = max(3, int(min(H, W) * 0.008)) | 1
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(mask)
+    A = H * W
+    blobs = []
+    for i in range(1, n):
+        x, y, w, h, ar = st[i]
+        if ar < A * 0.0004 or ar > A * 0.02:
+            continue
+        if x < W * 0.03 or y < H * 0.03 or x + w > W * 0.97 or y + h > H * 0.97:
+            continue  # border / shadows
+        if ar / float(w * h) < 0.6 or max(w, h) / max(1, min(w, h)) > 4.5:
+            continue  # not a compact rectangle (lines, outlines)
+        blobs.append([int(x), int(y), int(x + w), int(y + h)])
+
+    def ctr(bb):
+        return np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2])
+    # reference card = blobs with >=3 close neighbours (swatch grid)
+    card_idx = set()
+    for i, bi in enumerate(blobs):
+        r = 2.5 * max(bi[2] - bi[0], bi[3] - bi[1])
+        nb = sum(1 for j, bj in enumerate(blobs) if j != i and np.linalg.norm(ctr(bi) - ctr(bj)) < r)
+        if nb >= 3:
+            card_idx.add(i)
+    card_box = None
+    if len(card_idx) >= 4:
+        cb = np.array([blobs[i] for i in card_idx])
+        m = 0.02 * max(H, W)
+        card_box = [int(cb[:, 0].min() - m), int(cb[:, 1].min() - m),
+                    int(cb[:, 2].max() + m), int(cb[:, 3].max() + m)]
+    pads = []
+    for i, bb in enumerate(blobs):
+        if i in card_idx:
+            continue
+        c = ctr(bb)
+        if card_box and card_box[0] <= c[0] <= card_box[2] and card_box[1] <= c[1] <= card_box[3]:
+            continue
+        pads.append(bb)
+
+    # ---- orientation + location names ----
+    labels, rotation = [], None
+    if pads:
+        def rot(v, k):
+            for _ in range(k):
+                v = np.array([-v[1], v[0]])  # 90 degree step
+            return v
+        cs = np.array([ctr(p) for p in pads]); mid = cs.mean(0)
+        if card_box:
+            cvec = np.array([(card_box[0] + card_box[2]) / 2, (card_box[1] + card_box[3]) / 2]) - mid
+            rotation = max(range(4), key=lambda k: rot(cvec, k).sum())  # put card bottom-right
+        else:
+            rotation = 0
+        can = np.array([rot(c - mid, rotation) for c in cs])
+        order = np.argsort(can[:, 1])
+        if len(pads) >= 2:
+            g = int(np.argmax(np.diff(can[order, 1]))) + 1  # biggest vertical gap = between feet
+            groups = [list(order[:g]), list(order[g:])]
+            foot_names = ["Top foot", "Bottom foot"]
+        else:
+            groups, foot_names = [list(order)], ["Mat"]
+        pos = {1: ["center"], 2: ["left", "right"], 3: ["left", "middle", "right"]}
+        lab_of = {}
+        for gname, grp in zip(foot_names, groups):
+            grp = sorted(grp, key=lambda i: can[i, 0])
+            names = pos.get(len(grp), [f"#{j + 1}" for j in range(len(grp))])
+            for i, nm in zip(grp, names):
+                lab_of[i] = f"{gname} - {nm}"
+        idx = sorted(range(len(pads)), key=lambda i: (lab_of[i].startswith("Bottom"), can[i, 0]))
+        pads = [pads[i] for i in idx]; labels = [lab_of[i] for i in idx]
+    return pads, labels, card_box, paper_bgr, rotation
+
+
+def white_balance(img, white_px_box=None, white_bgr=None):
+    """Scale channels so a known-white area becomes neutral (target 240). Falls back to gray-world."""
     f = img.astype(np.float32)
-    if white_px_box:
+    if white_bgr is not None:
+        ref = np.asarray(white_bgr, np.float32)
+        target = 240.0
+    elif white_px_box:
         x1, y1, x2, y2 = white_px_box
         ref = np.median(f[y1:y2, x1:x2].reshape(-1, 3), axis=0)
         target = 240.0
@@ -160,20 +257,19 @@ def classify(ph):
 
 def analyze_image(img, boxes=None, white_box=None, expected=None, rec_id=None):
     h, w = img.shape[:2]
+    labels, card_box, paper_bgr, rotation = None, None, None, None
     if boxes:
         px_boxes, detector = [to_px(b, w, h) for b in boxes], "provided-boxes"
-    elif YOLO_MODEL:
-        res = YOLO_MODEL(img, verbose=False)[0]
-        px_boxes, detector = res.boxes.xyxy.int().tolist(), "yolo"
+        px_boxes = sort_reading_order([b for b in px_boxes if b[2] - b[0] > 3 and b[3] - b[1] > 3])
     else:
-        px_boxes, detector = detect_opencv(img), "opencv-fallback"
-    px_boxes = [b for b in px_boxes if b[2] - b[0] > 3 and b[3] - b[1] > 3]
-    px_boxes = sort_reading_order(px_boxes)
+        px_boxes, labels, card_box, paper_bgr, rotation = detect_mat(img)
+        detector = "mat-color-detector"
 
     wb = to_px(white_box, w, h) if white_box else None
-    balanced = white_balance(img, wb)
+    balanced = white_balance(img, wb, None if wb else paper_bgr)
 
     count_ok = expected is None or len(px_boxes) == expected
+    orientation_ok = bool(boxes) or card_box is not None
     strips, annotated = [], img.copy()
     for n, box in enumerate(px_boxes, 1):
         rgb, spread = pad_color(balanced, box)
@@ -184,25 +280,45 @@ def analyze_image(img, boxes=None, white_box=None, expected=None, rec_id=None):
             conf = "medium"
         else:
             conf = "low"
-        status = "ok" if (conf != "low" and count_ok) else "needs_review"
+        status = "ok" if (conf != "low" and count_ok and orientation_ok) else "needs_review"
         strips.append({
-            "id": rec_id, "strip_id": f"strip_{n}", "ph": ph, "classification": classify(ph),
+            "id": rec_id, "strip_id": f"strip_{n}",
+            "location": labels[n - 1] if labels else f"strip_{n}", "ph": ph, "classification": classify(ph),
             "confidence": conf, "color_distance": dist, "status": status,
             "box": [int(v) for v in box], "color_rgb": [int(v) for v in rgb],
         })
         x1, y1, x2, y2 = box
         color = (0, 200, 0) if status == "ok" else (0, 165, 255)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-        label = f"{n}: pH {ph:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        cv2.rectangle(annotated, (x1, max(0, y1 - th - 12)), (x1 + tw + 8, y1), color, -1)
-        cv2.putText(annotated, label, (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        label = str(n)
+        fs2 = max(0.5, w / 900); t2 = max(1, int(round(fs2 * 2)))
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs2, t2)
+        cv2.rectangle(annotated, (x1, max(0, y1 - th - 10)), (x1 + tw + 8, y1), color, -1)
+        cv2.putText(annotated, label, (x1 + 4, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 0, 0), t2)
     if wb:
         cv2.rectangle(annotated, (wb[0], wb[1]), (wb[2], wb[3]), (255, 255, 255), 2)
+    if card_box:
+        cv2.rectangle(annotated, tuple(card_box[:2]), tuple(card_box[2:]), (255, 0, 255), 2)
+        cv2.putText(annotated, "ref card", (card_box[0], max(12, card_box[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    # legend with location names (dark box, readable at any photo size)
+    if labels:
+        fs = max(0.45, w / 1100); th_ = max(1, int(round(fs * 2)))
+        lines = [f"{s['strip_id'][6:]}: {s['location']}  pH {s['ph']:.2f}" for s in strips]
+        sizes = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, fs, th_)[0] for t in lines]
+        lh = max(sz[1] for sz in sizes) + int(10 * fs + 6)
+        bw = max(sz[0] for sz in sizes) + 16
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (0, 0), (bw, lh * len(lines) + 8), (0, 0, 0), -1)
+        annotated[:] = cv2.addWeighted(overlay, 0.7, annotated, 0.3, 0)
+        for i, t in enumerate(lines):
+            cv2.putText(annotated, t, (8, lh * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th_)
     return {
         "id": rec_id, "num_strips": len(strips), "expected": expected, "count_ok": count_ok,
         "detector": detector, "chart": CHART_SOURCE,
-        "white_balance": "white_box" if wb else "gray-world",
+        "white_balance": "white_box" if wb else ("paper-auto" if paper_bgr is not None else "gray-world"),
+        "rotation_steps_90": rotation, "reference_card_found": card_box is not None,
+        "orientation_ok": orientation_ok,
         "strips": strips, "_annotated": annotated,
     }
 
@@ -212,7 +328,7 @@ app = FastAPI(title="pH Strip Reader")
 
 @app.get("/health")
 def health():
-    return {"ok": True, "detector": "yolo" if YOLO_MODEL else "opencv-fallback (or provided boxes)",
+    return {"ok": True, "detector": "mat-color-detector (or provided boxes)",
             "chart": CHART_SOURCE, "chart_points": list(CHART)}
 
 
