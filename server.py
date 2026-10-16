@@ -109,6 +109,56 @@ def detect_opencv(img):
     return out
 
 
+def order_corners(pts):
+    pts = np.array(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(1); d = np.diff(pts, axis=1).ravel()
+    return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], np.float32)
+
+
+def find_and_flatten_mat(img, long_side=1400):
+    """Find the mat (large bright region) and warp it flat, so photos taken at an angle,
+    from far away, or with background in view all look like a straight top-down photo.
+    Returns (flat_image, found_bool)."""
+    H, W = img.shape[:2]
+    scale = 800 / max(H, W)
+    small = cv2.resize(img, None, fx=scale, fy=scale) if scale < 1 else img.copy()
+    s = scale if scale < 1 else 1.0
+    L = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[..., 0]
+    L = cv2.GaussianBlur(L, (5, 5), 0)
+    otsu, _ = cv2.threshold(L, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    T = min(otsu, 130)  # keep the gray tape border as part of the mat, drop the dark floor
+    m = (L > T).astype(np.uint8) * 255
+    k = max(5, int(max(small.shape[:2]) * 0.02)) | 1
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return img, False
+    c = max(cnts, key=cv2.contourArea)
+    area_frac = cv2.contourArea(c) / float(small.shape[0] * small.shape[1])
+    if area_frac < 0.03:
+        return img, False
+    if area_frac > 0.93:            # mat already fills the photo
+        return img, False
+    hull = cv2.convexHull(c)
+    quad = None
+    peri = cv2.arcLength(hull, True)
+    for eps in np.linspace(0.01, 0.08, 15):
+        ap = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(ap) == 4:
+            quad = ap.reshape(4, 2); break
+    if quad is None:
+        quad = cv2.boxPoints(cv2.minAreaRect(hull))
+    q = order_corners(quad / s)
+    wA = np.linalg.norm(q[1] - q[0]); wB = np.linalg.norm(q[2] - q[3])
+    hA = np.linalg.norm(q[3] - q[0]); hB = np.linalg.norm(q[2] - q[1])
+    w, h = max(wA, wB), max(hA, hB)
+    f = long_side / max(w, h)
+    w, h = int(w * f), int(h * f)
+    M = cv2.getPerspectiveTransform(q, np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32))
+    return cv2.warpPerspective(img, M, (w, h)), True
+
+
 def detect_mat(img):
     """Deterministic pad finder for the DFU mat (no AI).
     1. Estimate the white paper color.
@@ -290,6 +340,16 @@ def classify(ph):
 
 
 def analyze_image(img, boxes=None, white_box=None, expected=None, rec_id=None):
+    mat_flattened = False
+    if not boxes:
+        flat, ok = find_and_flatten_mat(img)
+        if ok:
+            # use the flattened mat only if it reads at least as well as the original photo
+            def score(im):
+                p, _, cb, _, _, sw = detect_mat(im)
+                return (cb is not None and len(sw) == 14, expected is None or len(p) == expected, len(p))
+            if score(flat) >= score(img):
+                img, mat_flattened = flat, True
     h, w = img.shape[:2]
     labels, card_box, paper_bgr, rotation, swatches = None, None, None, None, []
     if boxes:
@@ -297,6 +357,12 @@ def analyze_image(img, boxes=None, white_box=None, expected=None, rec_id=None):
         px_boxes = sort_reading_order([b for b in px_boxes if b[2] - b[0] > 3 and b[3] - b[1] > 3])
     else:
         px_boxes, labels, card_box, paper_bgr, rotation, swatches = detect_mat(img)
+        if card_box is not None and rotation:
+            # turn the photo upright (card bottom-right) so the annotated image is easy to read
+            for _ in range(rotation):
+                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            px_boxes, labels, card_box, paper_bgr, rotation, swatches = detect_mat(img)
+            h, w = img.shape[:2]
         detector = "mat-color-detector"
 
     wb = to_px(white_box, w, h) if white_box else None
@@ -361,7 +427,7 @@ def analyze_image(img, boxes=None, white_box=None, expected=None, rec_id=None):
         "detector": detector, "chart": chart_used,
         "white_balance": "white_box" if wb else ("paper-auto" if paper_bgr is not None else "gray-world"),
         "rotation_steps_90": rotation, "reference_card_found": card_box is not None,
-        "orientation_ok": orientation_ok,
+        "orientation_ok": orientation_ok, "mat_flattened": mat_flattened,
         "strips": strips, "_annotated": annotated,
     }
 
