@@ -101,13 +101,22 @@ def classify(ph):
 def locate_all(img_bgr, timeout_s=30):
     """Call Gemini to locate strips, swatches (with pH labels), and a white box."""
     model = _init_genai()
+    
+    # --- NEW: Resize the image to save memory and speed up Gemini ---
+    h, w = img_bgr.shape[:2]
+    max_dim = 1024
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # ----------------------------------------------------------------
+
     ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not ok:
         raise RuntimeError("Could not encode image to JPEG")
     pil = Image.open(io.BytesIO(buf.tobytes()))
     resp = model.generate_content([LOCATE_PROMPT, pil])
     txt = (resp.text or "").strip()
-    # tolerant parse
     txt = txt.replace("```json", "").replace("```", "").strip()
     start = txt.find("{")
     end = txt.rfind("}")
