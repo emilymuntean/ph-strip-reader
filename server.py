@@ -47,10 +47,14 @@ async def analyze(
     if img is None:
         return {"error": "Could not read image"}
 
+    # --- NEW: Catch errors so we see what went wrong instead of a 502 ---
     try:
         res = reader.analyze(img, rec_id=id)
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Server Error: {type(e).__name__}: {str(e)}"}
+    # --------------------------------------------------------------------
 
     wb = res.pop("_wb_image", None)
     loc = res.pop("_locate", None)
