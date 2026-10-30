@@ -9,11 +9,20 @@ import numpy as np
 GAMMA = 2.2
 WHITE_TARGET = 235.0
 PAD_SHRINK = 0.15
-DIST_HIGH = float(os.environ.get("DIST_HIGH", 8.0))
-DIST_MED = float(os.environ.get("DIST_MED", 15.0))
+DIST_HIGH = float(os.environ.get("DIST_HIGH", 10.0)) # Increased slightly for universal card
+DIST_MED = float(os.environ.get("DIST_MED", 20.0))
 GLARE_L_MAX = 93.0
 GLARE_C_MAX = 10.0
 
+# Fallback standard calibration curve for Universal 1-14 strips in case the card is unreadable
+# Format: { pH_value: [L, a, b] }
+FALLBACK_CHART = {
+    5.0: [65.0, 20.0, 45.0],  # Orange
+    6.0: [70.0, -10.0, 50.0], # Yellow
+    7.0: [60.0, -25.0, 25.0], # Green
+    8.0: [50.0, -10.0, -15.0],# Blue-Green
+    9.0: [40.0, 5.0, -30.0]   # Blue
+}
 
 def rgb01_to_lab(rgb01):
     a = np.asarray(rgb01, np.float32).reshape(-1, 1, 3)
@@ -40,7 +49,6 @@ def white_balance_with_box(img_bgr, box_norm):
         patch = lin[y1:y2, x1:x2].reshape(-1, 3)
         ref = np.median(patch, axis=0)
     except Exception:
-        # Fallback to brightest 1%
         flat_lin = lin.reshape(-1, 3)
         brightest_idx = np.argsort(flat_lin.sum(axis=1))[-int(len(flat_lin)*0.01):]
         ref = np.median(flat_lin[brightest_idx], axis=0)
@@ -61,7 +69,6 @@ def sample_box_lab(bal01, box_norm, shrink=0.15):
     if x2 - x1 < 3 or y2 - y1 < 3:
         return None, None
 
-    # Shrink the box to avoid edges, glare, and the plastic border
     dx = int((x2 - x1) * shrink)
     dy = int((y2 - y1) * shrink)
     roi = bal01[y1 + dy:y2 - dy, x1 + dx:x2 - dx].reshape(-1, 3)
@@ -82,24 +89,34 @@ def sample_box_lab(bal01, box_norm, shrink=0.15):
 
 def build_chart_from_card(bal01, swatches):
     chart = {}
-    for sw in swatches:
+    # Sort by pH to make sure we process them in order
+    sorted_swatches = sorted(swatches, key=lambda x: float(x.get("ph", 0)))
+    
+    count = 0
+    for sw in sorted_swatches:
         try: 
             ph = float(sw["ph"])
             bbox = sw["bbox"]
         except: 
             continue
-        
-        # Shrink by 25% for swatches to get the purest center color
+            
+        # ONLY KEEP SWATCHES BETWEEN pH 5 AND 9
+        if ph < 5.0 or ph > 9.0:
+            continue
+            
         lab, _ = sample_box_lab(bal01, bbox, shrink=0.25)
         
         if lab is not None: 
-            # Reject swatches that are actually just white/glare (L > 90 and low saturation)
             L, a, b = lab
             C = np.hypot(a, b)
+            # Reject swatches that are actually white glare or shadows
             if L > 88 and C < 12:
-                continue # This is a glare spot, not a real swatch
+                continue 
                 
             chart[ph] = lab
+            count += 1
+            if count >= 6:
+                break # Stop after 6 valid swatches
             
     return dict(sorted(chart.items()))
 
@@ -133,14 +150,19 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
     except Exception as e:
         return {"id": rec_id, "error": f"White balance failed: {e}", "needs_retake": True, "strips": [], "swatches_found": 0}
 
+    # Try to build from the card, fallback to standard curve if it fails
     chart = build_chart_from_card(wb, swatches_in)
     
+    used_fallback = False
     if len(chart) < 2:
-        return {"id": rec_id, "error": f"Only {len(chart)} swatches readable (need >=2)", "needs_retake": True, "strips": [], "swatches_found": len(chart)}
+        # Use fallback curve
+        chart = {k: np.array(v) for k, v in FALLBACK_CHART.items()}
+        used_fallback = True
 
     chart_range = (min(chart), max(chart))
     strips_out = []
     
+    # Ensure we only process the 8 strips Gemini found
     strips_in = strips_in[:8]
     
     for i, s in enumerate(strips_in, 1):
@@ -154,9 +176,15 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
 
         ph, dist, flag = lab_to_ph(lab, chart)
         rec["ph"], rec["classification"], rec["color_distance"], rec["range_flag"] = ph, classify(ph), dist, flag
-        rec["confidence"] = "high" if dist <= DIST_HIGH else ("medium" if dist <= DIST_MED else "low")
+        
+        # If fallback is used, we are less confident
+        if used_fallback:
+            rec["confidence"] = "medium" if dist <= DIST_HIGH else "low"
+        else:
+            rec["confidence"] = "high" if dist <= DIST_HIGH else ("medium" if dist <= DIST_MED else "low")
         
         notes = []
+        if used_fallback: notes.append("used standard fallback colors")
         if meta and meta.get("spread", 0) > 12: notes.append("uneven color")
         if meta and meta.get("glare_frac", 0) > 0.30: notes.append("glare")
         
@@ -169,7 +197,7 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
     return {
         "id": rec_id, 
         "num_strips": len(strips_out), 
-        "swatches_found": len(chart), 
+        "swatches_found": 0 if used_fallback else len(chart), 
         "swatch_phs": sorted(chart.keys()), 
         "white_srgb": wb_info["white_srgb"], 
         "strips": strips_out, 
