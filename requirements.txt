@@ -3,5 +3,5 @@ uvicorn[standard]
 python-multipart
 numpy
 opencv-python-headless>=4.8
-google-generativeai
 pillow
+requests
