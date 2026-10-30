@@ -40,6 +40,11 @@ def white_balance_with_box(img_bgr, box_norm):
     
     try:
         l, t, r, b = box_norm
+        # Handle pixel-based coordinates
+        if max(l, t, r, b) > 1.0:
+            l /= w; r /= w
+            t /= h; b /= h
+
         x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
         x2 = min(w, int(r * w)); y2 = min(h, int(b * h))
         if x2 - x1 < 5 or y2 - y1 < 5:
@@ -63,7 +68,11 @@ def sample_box_lab(bal01, box_norm, shrink=0.15):
     h, w = bal01.shape[:2]
     l, t, r, b = box_norm
     
-    # --- FIX: Ensure the box has a minimum size (at least 2.5% of image width/height) ---
+    # --- FIX: Convert pixel coordinates to normalized ---
+    if max(l, t, r, b) > 1.0:
+        l /= w; r /= w
+        t /= h; b /= h
+
     min_w = 0.025
     min_h = 0.025
     
@@ -83,7 +92,6 @@ def sample_box_lab(bal01, box_norm, shrink=0.15):
     if x2 - x1 < 3 or y2 - y1 < 3:
         return None, None
 
-    # Now we can safely shrink it without it disappearing
     dx = int((x2 - x1) * shrink)
     dy = int((y2 - y1) * shrink)
     roi = bal01[y1 + dy:y2 - dy, x1 + dx:x2 - dx].reshape(-1, 3)
@@ -177,7 +185,7 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
     
     for i, s in enumerate(strips_in, 1):
         rec = {"strip_id": s.get("zone_id") or f"strip_{i}", "ph": None, "classification": None, "confidence": "none", "color_distance": None, "range_flag": None, "status": "needs_review", "note": ""}
-        lab, meta = sample_box_lab(wb, s.get("bbox") or [0,0,0,0], shrink=0.10) # Reduced shrink to 10% for strips
+        lab, meta = sample_box_lab(wb, s.get("bbox") or [0,0,0,0], shrink=0.10)
         
         if lab is None:
             rec["note"] = "strip box unreadable"
@@ -221,6 +229,10 @@ def annotate(img_bgr, loc):
     
     def draw(box, color, label):
         l, t, r, b = box
+        if max(l, t, r, b) > 1.0:
+            l /= w; r /= w
+            t /= h; b /= h
+            
         cv2.rectangle(out, (int(l*w), int(t*h)), (int(r*w), int(b*h)), color, th)
         if label: cv2.putText(out, label, (int(l*w), max(15, int(t*h)-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, th)
         
