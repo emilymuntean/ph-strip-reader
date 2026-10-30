@@ -190,6 +190,61 @@ def color_diff_mask(img):
     return mask
 
 
+def split_merged_swatches(cands):
+    """Split merged swatch blobs back into k single swatches (any card rotation).
+
+    On small or heavily JPEG-compressed photos (e.g. AppSheet ~600px) adjacent
+    card swatches bleed together into one blob. A single swatch is clearly
+    elongated (w/h ~0.45 tall or ~2.2 wide depending on card rotation); a
+    merged group is roughly square. Determine the dominant single orientation,
+    then cut each square-ish blob along the perpendicular axis into
+    round(long_dim / median_single_long_dim) equal parts.
+    Pads (much wider AND flatter, or tall skinnies) are never square-ish
+    and are left untouched.
+    """
+    if not cands:
+        return cands, 0
+    rats = [(b[2] - b[0]) / float(b[3] - b[1]) for b in cands]
+    tall = [b for b, r in zip(cands, rats) if r < 0.65]      # portrait swatches
+    wide = [b for b, r in zip(cands, rats) if r > 1.54]     # landscape swatches
+    if len(tall) >= len(wide):
+        # singles are tall: merged blobs are wide -> cut along X
+        singles, split_axis = tall, 0
+        if not singles:
+            return cands, 0
+        med_long = float(np.median([b[2] - b[0] for b in singles]))   # single width
+        med_short = float(np.median([b[3] - b[1] for b in singles]))  # single height
+    else:
+        # singles are wide (card rotated 90): merged blobs are tall -> cut along Y
+        singles, split_axis = wide, 1
+        med_long = float(np.median([b[3] - b[1] for b in singles]))   # single height
+        med_short = float(np.median([b[2] - b[0] for b in singles]))  # single width
+        if not singles:
+            return cands, 0
+    if med_long <= 0:
+        return cands, 0
+    out, n_split = [], 0
+    for b in cands:
+        x0, y0, x1, y1 = b
+        w, h = x1 - x0, y1 - y0
+        ratio = w / float(h)
+        long_dim, short_dim = (w, h) if split_axis == 0 else (h, w)
+        # square-ish blob with the right thickness = k merged swatches
+        if 0.65 <= ratio <= 1.54 and short_dim <= 2.0 * med_short:
+            k = int(round(long_dim / med_long))
+            k = min(max(k, 2), 4)
+            if k >= 2 and abs(long_dim - k * med_long) < 0.75 * med_long:
+                for i in range(k):
+                    if split_axis == 0:  # cut X
+                        out.append([x0 + w * i // k, y0, x0 + w * (i + 1) // k, y1])
+                    else:                # cut Y
+                        out.append([x0, y0 + h * i // k, x1, y0 + h * (i + 1) // k])
+                n_split += 1
+                continue
+        out.append(b)
+    return out, n_split
+
+
 def find_card(img):
     """Detect the 14-swatch reference card, wherever it is in the photo.
 
@@ -214,60 +269,97 @@ def find_card(img):
         if fill < 0.55:
             continue
         cands.append([int(x), int(y), int(x + w), int(y + h)])
+    # Small/compressed photos (e.g. AppSheet ~600px) blur adjacent swatches
+    # together into one wide blob. Splitting is a FALLBACK, tried only after
+    # plain detection fails: first with stats from the candidate card cluster
+    # itself (its own intact swatches set the expected size/spacing), then
+    # with whole-image stats. A bad split still cannot pass the strict 2x7
+    # grid check, and pieces must land on the grid the intact swatches form.
+    n_split = 0
     if len(cands) < 8:
-        return None, None, paper_estimate(img)
+        return None, None, paper_estimate(img), {"candidates": len(cands), "split": 0, "grid": False}
 
     def ctr(bb):
         return np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2])
 
-    # single-linkage proximity clustering; only link similarly-SIZED blobs that
-    # are close (pads are 3-5x bigger than swatches and must not chain in)
-    centers = [ctr(b) for b in cands]
-    sizes = [(b[2] - b[0]) * (b[3] - b[1]) for b in cands]
-    maxdims = [max(b[2] - b[0], b[3] - b[1]) for b in cands]
-    parent = list(range(len(cands)))
+    def cluster(boxes):
+        """single-linkage proximity clustering; only link similarly-SIZED blobs
+        that are close (pads are 3-5x bigger than swatches and must not chain in).
+        Returns list of member-index lists."""
+        centers = [ctr(b) for b in boxes]
+        sizes = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+        maxdims = [max(b[2] - b[0], b[3] - b[1]) for b in boxes]
+        parent = list(range(len(boxes)))
 
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
 
-    for i in range(len(cands)):
-        for j in range(i + 1, len(cands)):
-            d = np.linalg.norm(centers[i] - centers[j])
-            r = 2.0 * min(maxdims[i], maxdims[j])
-            similar = max(sizes[i], sizes[j]) <= 2.2 * min(sizes[i], sizes[j])
-            if d < r and similar:
-                a, b = find(i), find(j)
-                if a != b:
-                    parent[b] = a
-    groups = {}
-    for i in range(len(cands)):
-        groups.setdefault(find(i), []).append(i)
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                d = np.linalg.norm(centers[i] - centers[j])
+                r = 2.0 * min(maxdims[i], maxdims[j])
+                similar = max(sizes[i], sizes[j]) <= 2.2 * min(sizes[i], sizes[j])
+                if d < r and similar:
+                    a, b = find(i), find(j)
+                    if a != b:
+                        parent[b] = a
+        groups = {}
+        for i in range(len(boxes)):
+            groups.setdefault(find(i), []).append(i)
+        return list(groups.values())
 
-    # keep clusters with enough members to be a (possibly partial) card grid
-    best = None
-    for members in groups.values():
+    def best_card(boxes):
+        """Best complete-card grid across clusters of these boxes, or None."""
+        best = None
+        for members in cluster(boxes):
+            if len(members) < 8:
+                continue
+            swatches = [boxes[i] for i in members]
+            grid, idxs = grid_slots(swatches)
+            if grid is None:
+                continue
+            # prefer the cluster with the most grid-fitting swatches
+            if best is None or len(idxs) > len(best[1]):
+                best = (grid, idxs, swatches)
+        return best
+
+    def finish(best, n_split):
+        grid, idxs, swatches = best
+        grid_swatches = [swatches[i] for i in idxs]
+        xs = [b[0] for b in grid_swatches] + [b[2] for b in grid_swatches]
+        ys = [b[1] for b in grid_swatches] + [b[3] for b in grid_swatches]
+        m = 0.015 * max(H, W)
+        card_box = [int(min(xs) - m), int(min(ys) - m), int(max(xs) + m), int(max(ys) + m)]
+        return grid_swatches, card_box, paper_estimate(img), {"candidates": len(cands), "split": n_split, "grid": True}
+
+    # attempt 1: plain detection on the raw blobs (no splitting) - this is the
+    # behavior for every photo where the swatches are already separate blobs
+    best = best_card(cands)
+    if best is not None:
+        return finish(best, 0)
+
+    # attempt 2: split merged blobs using stats from the largest card-like
+    # cluster itself (its intact swatches define the expected swatch size)
+    for members in sorted(cluster(cands), key=len, reverse=True):
         if len(members) < 8:
-            continue
-        swatches = [cands[i] for i in members]
-        grid, idxs = grid_slots(swatches)
-        if grid is None:
-            continue
-        # prefer the cluster with the most grid-fitting swatches
-        if best is None or len(idxs) > len(best[1]):
-            best = (grid, idxs, swatches)
-    if best is None:
-        return None, None, paper_estimate(img)
+            break
+        local = [cands[i] for i in members]
+        local_split, n_local = split_merged_swatches(local)
+        best = best_card(local_split)
+        if best is not None:
+            return finish(best, n_local)
 
-    grid, idxs, swatches = best
-    grid_swatches = [swatches[i] for i in idxs]
-    xs = [b[0] for b in grid_swatches] + [b[2] for b in grid_swatches]
-    ys = [b[1] for b in grid_swatches] + [b[3] for b in grid_swatches]
-    m = 0.015 * max(H, W)
-    card_box = [int(min(xs) - m), int(min(ys) - m), int(max(xs) + m), int(max(ys) + m)]
-    return grid_swatches, card_box, paper_estimate(img)
+    # attempt 3: whole-image stats (handles a merged blob too big to cluster
+    # with the intact swatches)
+    global_split, n_global = split_merged_swatches(cands)
+    best = best_card(global_split)
+    if best is not None:
+        return finish(best, n_global)
+
+    return None, None, paper_estimate(img), {"candidates": len(cands), "split": n_global, "grid": False}
 
 
 def grid_slots(swatches):
@@ -564,17 +656,17 @@ def analyze_image(img, zones=None, white_box=None, expected=None, rec_id=None):
     # photo (the DFU mat is a transparent acrylic plate on paper, which the
     # bright-region warp used to grab by mistake and destroy the layout).
     if not zones:
-        sw0, cb0, _ = find_card(img)
+        sw0, cb0, _, diag0 = find_card(img)
         if cb0 is None or len(sw0) < 12:
             flat, ok = find_and_flatten_mat(img)
             if ok:
-                swf, cbf, _ = find_card(flat)
+                swf, cbf, _, diagf = find_card(flat)
                 if cbf is not None and len(swf) >= 12 and (cb0 is None or len(sw0) < 12):
                     img, mat_flattened = flat, True
     h, w = img.shape[:2]
 
     # ---- ALWAYS read the reference card (fix #1) ----
-    swatches, card_box, paper_bgr = find_card(img)
+    swatches, card_box, paper_bgr, card_diag = find_card(img)
     card_found = card_box is not None and swatches and len(swatches) >= 12
 
     if zones:
@@ -594,7 +686,7 @@ def analyze_image(img, zones=None, white_box=None, expected=None, rec_id=None):
             for _ in range(rotation):
                 img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             h, w = img.shape[:2]
-            swatches, card_box, paper_bgr = find_card(img)
+            swatches, card_box, paper_bgr, card_diag = find_card(img)
             card_found = card_box is not None and swatches and len(swatches) >= 12
             px_boxes, labels, paper_bgr, _ = detect_pads(img, card_box)
         detector = "mat-color-detector"
@@ -680,6 +772,7 @@ def analyze_image(img, zones=None, white_box=None, expected=None, rec_id=None):
         "white_balance": "white_box" if wb else ("paper-auto" if paper_bgr is not None else "gray-world"),
         "rotation_steps_90": rotation if not zones else 0,
         "reference_card_found": card_found, "mat_flattened": mat_flattened,
+        "card_diag": card_diag,
         "strips": strips, "_annotated": annotated,
     }
 
@@ -689,7 +782,8 @@ app = FastAPI(title="pH Strip Reader")
 
 @app.get("/health")
 def health():
-    return {"ok": True, "detector": "mat-color-detector (or provided boxes) + card always read from photo",
+    return {"ok": True, "version": "2.1",
+            "detector": "mat-color-detector (or provided boxes) + card always read from photo",
             "chart": "reference card in each photo" + (" (fallback: chart.json)" if CHART else ""),
             "correction": CORRECTION}
 
@@ -697,17 +791,40 @@ def health():
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...), boxes: str = Form(None), white_box: str = Form(None),
                   expected: int = Form(None), id: str = Form(None)):
-    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    raw = await file.read()
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         # real error status so callers (n8n) fail at THIS request with the
         # actual message instead of a confusing 'field not set' downstream
         raise HTTPException(status_code=400, detail="Could not read image - not a valid JPG/PNG")
+    # Memory safety: phone photos are 12-50MP and the Lab-color masks are
+    # ~6 float arrays per pixel - a 24MP photo needs ~2GB RAM and gets the
+    # free-tier container OOM-killed (HTTP 502). 1600px long edge is plenty
+    # for 10px-wide swatches and keeps peak RAM well under 512MB.
+    rh, rw = img.shape[:2]
+    downscaled = False
+    f = 1.0
+    if max(rh, rw) > 1600:
+        f = 1600.0 / max(rh, rw)
+        img = cv2.resize(img, (int(rw * f), int(rh * f)), interpolation=cv2.INTER_AREA)
+        downscaled = True
     try:
         zones, wb_from_boxes = parse_boxes(boxes)
+        # if the image was downscaled, pixel-coordinate boxes (max value > 1.5)
+        # must be scaled to the processed size; normalized 0-1 boxes are fine
+        if downscaled and zones:
+            for z in zones:
+                b = z["bbox"]
+                if b and max(b) > 1.5:
+                    z["bbox"] = [v * f for v in b]
         wb = json.loads(white_box) if white_box else wb_from_boxes
+        if downscaled and wb and isinstance(wb, (list, tuple)) and max(wb) > 1.5:
+            wb = [v * f for v in wb]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse boxes/white_box JSON: {e}")
     result = analyze_image(img, zones, wb, expected, id)
+    result["diagnostics"] = {"received_wh": [rw, rh], "processed_wh": [img.shape[1], img.shape[0]],
+                             "downscaled": downscaled, "jpeg_kb": round(len(raw) / 1024)}
     ok, buf = cv2.imencode(".jpg", result.pop("_annotated"))
     result["annotated_image_base64"] = base64.b64encode(buf).decode()
     return result
