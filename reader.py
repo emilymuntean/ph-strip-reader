@@ -16,7 +16,6 @@ GLARE_C_MAX = 10.0
 
 
 def rgb01_to_lab(rgb01):
-    """Convert RGB to Lab for accurate color distance math."""
     a = np.asarray(rgb01, np.float32).reshape(-1, 1, 3)
     return cv2.cvtColor(a, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(float)
 
@@ -28,9 +27,7 @@ def classify(ph):
 
 
 def white_balance_with_box(img_bgr, box_norm):
-    """White-balance the image using the white patch. Falls back to brightest pixels if box fails."""
     h, w = img_bgr.shape[:2]
-    
     rgb = img_bgr[:, :, ::-1].astype(np.float32) / 255.0
     lin = rgb ** GAMMA
     
@@ -38,21 +35,14 @@ def white_balance_with_box(img_bgr, box_norm):
         l, t, r, b = box_norm
         x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
         x2 = min(w, int(r * w)); y2 = min(h, int(b * h))
-        
         if x2 - x1 < 5 or y2 - y1 < 5:
             raise ValueError("Box too small")
-            
         patch = lin[y1:y2, x1:x2].reshape(-1, 3)
-        if patch.size == 0:
-            raise ValueError("Empty patch")
-            
         ref = np.median(patch, axis=0)
-        
     except Exception:
-        # FALLBACK: If Gemini's box is bad, use the top 1% brightest pixels in the image
+        # Fallback to brightest 1%
         flat_lin = lin.reshape(-1, 3)
-        brightness = flat_lin.sum(axis=1)
-        brightest_idx = np.argsort(brightness)[-int(len(brightness)*0.01):]
+        brightest_idx = np.argsort(flat_lin.sum(axis=1))[-int(len(flat_lin)*0.01):]
         ref = np.median(flat_lin[brightest_idx], axis=0)
 
     target = (WHITE_TARGET / 255.0) ** GAMMA
@@ -64,7 +54,6 @@ def white_balance_with_box(img_bgr, box_norm):
 
 
 def sample_box_lab(bal01, box_norm):
-    """Crop the box, remove glare, and calculate the median color."""
     h, w = bal01.shape[:2]
     l, t, r, b = box_norm
     x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
@@ -87,11 +76,10 @@ def sample_box_lab(bal01, box_norm):
         roi = roi[~glare]
         
     med = np.median(lab, axis=0)
-    return med, {"spread": float(np.mean(np.linalg.norm(lab - med, axis=1))), "glare_frac": float(glare.mean()), "rgb": (np.median(roi, axis=0) * 255).round().astype(int).tolist()}
+    return med, {"spread": float(np.mean(np.linalg.norm(lab - med, axis=1))), "glare_frac": float(glare.mean())}
 
 
 def build_chart_from_card(bal01, swatches):
-    """Build a reference chart from the swatches Gemini found on the card."""
     chart = {}
     for sw in swatches:
         try: 
@@ -102,11 +90,12 @@ def build_chart_from_card(bal01, swatches):
         lab, _ = sample_box_lab(bal01, bbox)
         if lab is not None: 
             chart[ph] = lab
+            
+    # Sort by pH and ensure we don't have duplicate pH values confusing the math
     return dict(sorted(chart.items()))
 
 
 def lab_to_ph(lab, chart):
-    """Project the strip's color onto the piecewise-linear curve of swatch colors."""
     keys = list(chart)
     best = (1e9, keys[0], 0, 0.0)
     for i in range(len(keys) - 1):
@@ -123,7 +112,6 @@ def lab_to_ph(lab, chart):
 
 
 def analyze_with_boxes(img_bgr, loc, rec_id=None):
-    """Main function called by server.py. Uses boxes from n8n instead of calling Gemini."""
     if loc.get("needs_retake"):
         return {"id": rec_id, "error": "Retake photo: " + (loc.get("reason") or "unreadable"), "needs_retake": True, "strips": [], "swatches_found": 0}
 
@@ -131,18 +119,22 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
     swatches_in = loc.get("swatches") or []
     white_box = loc.get("white_box")
 
-    # Even if white_box is missing, the white_balance function will now fall back safely
     try:
         wb, wb_info = white_balance_with_box(img_bgr, white_box)
     except Exception as e:
         return {"id": rec_id, "error": f"White balance failed: {e}", "needs_retake": True, "strips": [], "swatches_found": 0}
 
     chart = build_chart_from_card(wb, swatches_in)
-    if len(chart) < 3:
-        return {"id": rec_id, "error": f"Only {len(chart)} swatches readable (need >=3)", "needs_retake": True, "strips": [], "swatches_found": len(chart), "white_srgb": wb_info["white_srgb"]}
+    
+    # NEED AT LEAST 2 SWATCHES TO DO MATH
+    if len(chart) < 2:
+        return {"id": rec_id, "error": f"Only {len(chart)} swatches readable (need >=2)", "needs_retake": True, "strips": [], "swatches_found": len(chart)}
 
     chart_range = (min(chart), max(chart))
     strips_out = []
+    
+    # Limit to max 8 strips so we don't read the reference card by accident
+    strips_in = strips_in[:8]
     
     for i, s in enumerate(strips_in, 1):
         rec = {"strip_id": s.get("zone_id") or f"strip_{i}", "ph": None, "classification": None, "confidence": "none", "color_distance": None, "range_flag": None, "status": "needs_review", "note": ""}
@@ -160,8 +152,6 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
         notes = []
         if meta and meta.get("spread", 0) > 12: notes.append("uneven color")
         if meta and meta.get("glare_frac", 0) > 0.30: notes.append("glare")
-        if flag == "below": notes.append(f"below {chart_range[0]:g}")
-        elif flag == "above": notes.append(f"above {chart_range[1]:g}")
         
         if rec["confidence"] in ("high", "medium") and not notes: 
             rec["status"] = "ok"
@@ -181,7 +171,6 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
 
 
 def annotate(img_bgr, loc):
-    """Draw boxes on the image for debugging/UI."""
     out = img_bgr.copy()
     h, w = out.shape[:2]
     th = max(2, w // 600)
@@ -198,6 +187,5 @@ def annotate(img_bgr, loc):
 
 
 def encode_b64(img, quality=88):
-    """Convert image to base64 for API response."""
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return base64.b64encode(buf).decode()
