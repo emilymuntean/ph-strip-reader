@@ -1,3 +1,21 @@
-# pH Strip Reader API
-Color-math pH reader for the DFU pH mat. `GET /health`, `POST /analyze` (form fields: file, boxes, white_box, expected, id).
-Deployed on Render (Docker, Free instance).
+# pH Strip Reader (v4)
+
+Reads pH from a foot-mat photo using the reference card in the same image.
+- Gemini locates strips, reference-card swatches (with printed pH labels), and a white patch.
+- Python white-balances, samples swatch colors, and projects strip colors onto the swatch curve.
+
+## Deploy on Render
+1. Push this repo.
+2. Create a Web Service, environment Python.
+3. Start command: `uvicorn server:app --host 0.0.0.0 --port $PORT`
+4. Env vars: `GEMINI_API_KEY`, optional `GEMINI_MODEL`, optional `DIST_HIGH`, `DIST_MED`.
+
+## Endpoints
+- `GET /health`
+- `POST /analyze` (multipart: `file`, optional `id`, optional `debug=true`)
+
+## n8n
+Send only the photo:
+- HTTP Request, Form-Data, field name `file`, input binary property `strip`.
+- Optional field `id` with the record id.
+Remove old `boxes` and `expected` fields.
