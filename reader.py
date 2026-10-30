@@ -40,9 +40,10 @@ def _init_genai():
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     genai.configure(api_key=api_key)
-    _vision = genai.GenerativeModel(
-        os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    )
+    
+    # --- Modified here: Change the old model name to the latest gemini-3.8-flash ---
+    _vision = genai.GenerativeModel("gemini-3.8-flash")
+    
     _genai_ready = True
     return _vision
 
