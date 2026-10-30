@@ -28,21 +28,37 @@ def classify(ph):
 
 
 def white_balance_with_box(img_bgr, box_norm):
-    """White-balance the image using the white patch coordinates from Gemini."""
+    """White-balance the image using the white patch. Falls back to brightest pixels if box fails."""
     h, w = img_bgr.shape[:2]
-    l, t, r, b = box_norm
-    x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
-    x2 = min(w, int(r * w)); y2 = min(h, int(b * h))
-    if x2 - x1 < 5 or y2 - y1 < 5:
-        raise ValueError("white_box too small or out of bounds")
-
+    
     rgb = img_bgr[:, :, ::-1].astype(np.float32) / 255.0
     lin = rgb ** GAMMA
-    patch = lin[y1:y2, x1:x2].reshape(-1, 3)
-    ref = np.median(patch, axis=0)
+    
+    try:
+        l, t, r, b = box_norm
+        x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
+        x2 = min(w, int(r * w)); y2 = min(h, int(b * h))
+        
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            raise ValueError("Box too small")
+            
+        patch = lin[y1:y2, x1:x2].reshape(-1, 3)
+        if patch.size == 0:
+            raise ValueError("Empty patch")
+            
+        ref = np.median(patch, axis=0)
+        
+    except Exception:
+        # FALLBACK: If Gemini's box is bad, use the top 1% brightest pixels in the image
+        flat_lin = lin.reshape(-1, 3)
+        brightness = flat_lin.sum(axis=1)
+        brightest_idx = np.argsort(brightness)[-int(len(brightness)*0.01):]
+        ref = np.median(flat_lin[brightest_idx], axis=0)
+
     target = (WHITE_TARGET / 255.0) ** GAMMA
     gains = target / np.maximum(ref, 1e-4)
     out = np.clip(lin * gains, 0, 1) ** (1.0 / GAMMA)
+    
     white_srgb = (ref ** (1.0 / GAMMA)) * 255.0
     return out, {"white_srgb": [round(float(v), 1) for v in white_srgb], "gains": [round(float(v), 3) for v in gains]}
 
@@ -115,9 +131,7 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
     swatches_in = loc.get("swatches") or []
     white_box = loc.get("white_box")
 
-    if not white_box:
-        return {"id": rec_id, "error": "No white reference found", "needs_retake": True, "strips": [], "swatches_found": 0}
-
+    # Even if white_box is missing, the white_balance function will now fall back safely
     try:
         wb, wb_info = white_balance_with_box(img_bgr, white_box)
     except Exception as e:
