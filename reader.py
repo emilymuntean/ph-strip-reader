@@ -53,7 +53,7 @@ def white_balance_with_box(img_bgr, box_norm):
     return out, {"white_srgb": [round(float(v), 1) for v in white_srgb], "gains": [round(float(v), 3) for v in gains]}
 
 
-def sample_box_lab(bal01, box_norm):
+def sample_box_lab(bal01, box_norm, shrink=0.15):
     h, w = bal01.shape[:2]
     l, t, r, b = box_norm
     x1 = max(0, int(l * w)); y1 = max(0, int(t * h))
@@ -61,8 +61,9 @@ def sample_box_lab(bal01, box_norm):
     if x2 - x1 < 3 or y2 - y1 < 3:
         return None, None
 
-    dx = int((x2 - x1) * PAD_SHRINK)
-    dy = int((y2 - y1) * PAD_SHRINK)
+    # Shrink the box to avoid edges, glare, and the plastic border
+    dx = int((x2 - x1) * shrink)
+    dy = int((y2 - y1) * shrink)
     roi = bal01[y1 + dy:y2 - dy, x1 + dx:x2 - dx].reshape(-1, 3)
     if roi.shape[0] < 20:
         return None, None
@@ -87,11 +88,19 @@ def build_chart_from_card(bal01, swatches):
             bbox = sw["bbox"]
         except: 
             continue
-        lab, _ = sample_box_lab(bal01, bbox)
+        
+        # Shrink by 25% for swatches to get the purest center color
+        lab, _ = sample_box_lab(bal01, bbox, shrink=0.25)
+        
         if lab is not None: 
+            # Reject swatches that are actually just white/glare (L > 90 and low saturation)
+            L, a, b = lab
+            C = np.hypot(a, b)
+            if L > 88 and C < 12:
+                continue # This is a glare spot, not a real swatch
+                
             chart[ph] = lab
             
-    # Sort by pH and ensure we don't have duplicate pH values confusing the math
     return dict(sorted(chart.items()))
 
 
@@ -126,19 +135,17 @@ def analyze_with_boxes(img_bgr, loc, rec_id=None):
 
     chart = build_chart_from_card(wb, swatches_in)
     
-    # NEED AT LEAST 2 SWATCHES TO DO MATH
     if len(chart) < 2:
         return {"id": rec_id, "error": f"Only {len(chart)} swatches readable (need >=2)", "needs_retake": True, "strips": [], "swatches_found": len(chart)}
 
     chart_range = (min(chart), max(chart))
     strips_out = []
     
-    # Limit to max 8 strips so we don't read the reference card by accident
     strips_in = strips_in[:8]
     
     for i, s in enumerate(strips_in, 1):
         rec = {"strip_id": s.get("zone_id") or f"strip_{i}", "ph": None, "classification": None, "confidence": "none", "color_distance": None, "range_flag": None, "status": "needs_review", "note": ""}
-        lab, meta = sample_box_lab(wb, s.get("bbox") or [0,0,0,0])
+        lab, meta = sample_box_lab(wb, s.get("bbox") or [0,0,0,0], shrink=0.15)
         
         if lab is None:
             rec["note"] = "strip box unreadable"
